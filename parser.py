@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import openpyxl
 
 
 class html_converter:
@@ -20,59 +21,96 @@ class html_converter:
         self.data_end = data_end
         self.link = link
 
-    # Метод загружает и парсит HTML-страницу по указанному URL с параметром пагинации.
-    def get_page(self, number_page):
-        parametr = {
-            'page': f'page-{number_page}'
-        }
-        result = self.open_link(self.link, parametr)
-        if result != 0:
-            soup = BeautifulSoup(result.text, 'html.parser')
-            print(f'Страница под номером {number_page} обработана')
-            return soup
-        else:
+    def get_page(self, number_page=None):
+        """Загрузить страницу. Если number_page задан — с пагинацией."""
+        parametr = None
+        if number_page is not None:
+            parametr = {'page': f'page-{number_page}'}
+        response = self.open_link(self.link, parametr)
+        if response is None:
             return None
+        return BeautifulSoup(response.text, 'html.parser')
 
-    # Метод извлекает все ссылки на XLS-файлы из HTML-страницы, используя BeautifulSoup.
     def get_links_with_file(self, soup: BeautifulSoup):
         elements = soup.find_all('div', class_='accordeon-inner__item')
-
         results = []
 
         for item in elements:
-            link_tag = item.find('a', class_='xlsx')
-            big_data_tag = item.find('div', class_='accordeon-inner__item-inner__title')
-            date_tag = None
-            if big_data_tag:
-                date_tag = big_data_tag.find('p')
+            link_tag = None
+            for a in item.find_all('a', href=True):
+                href = a['href']
+                # проверяем .xls/.xlsx где угодно в URL — не только в конце
+                if '.xls' in href.lower() or '/oil_xls/' in href:
+                    link_tag = a
+                    break
+            if link_tag is None:
+                continue
 
+            href = link_tag['href']
+            date_tag = item.find('span')
+            if date_tag is None:
+                continue
 
-            if link_tag and date_tag:
-                xlsx_href = link_tag.get('href')
+            m = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', date_tag.text)
+            if not m:
+                continue
+            year = int(m.group(3))
+            if not (self.data_start <= year <= self.data_end):
+                continue
 
-                if xlsx_href and not xlsx_href.startswith('http'):
-                    xlsx_url = 'https://spimex.com' + xlsx_href
-                else:
-                    xlsx_url = xlsx_href
+            url = href if href.startswith('http') else 'https://spimex.com' + href
+            results.append({'date': year, 'link': url})
 
-                trade_date = date_tag.text.strip()
-
-                results.append({
-                    'date': trade_date,
-                    'xlsx_link': xlsx_url
-                })
         return results
 
     def download_all_xlsx(self):
-        pages = self.get_page(1)
-        links = self.get_links_with_file(pages)
-        for item in links:
-            link = item['xlsx_link']
-            year = int(item['date'].split(' ')[1])
-            if year >= self.data_start and year <= self.data_end:
-                downloaded = self.read_excel_file(link)
-                return downloaded
+        links = self.get_all_links(max_pages=30)
+        print(f'\n=== Всего найдено ссылок: {len(links)} ===')
+        for i, item in enumerate(links):
+            print(f'{i:3}  {item["date"]!r:40}  {item["link"]}')
+        return links
 
+    def get_all_links(self, start_page=19, max_pages=422, empty_streak_limit=5):
+        all_links = []
+        seen = set()
+        empty_streak = 0
+
+        for page in range(start_page, max_pages + 1):
+            soup = self.get_page(page)
+            if soup is None:
+                print(f'Страница {page}: не загрузилась')
+                empty_streak += 1
+                if empty_streak >= empty_streak_limit:
+                    print(f'{empty_streak} неудач подряд — стоп')
+                    break
+                continue
+
+            links = self.get_links_with_file(soup)
+            if not links:
+                print(f'Страница {page}: XLS нет')
+                empty_streak += 1
+                if empty_streak >= empty_streak_limit:
+                    print(f'{empty_streak} пустых подряд — стоп')
+                    break
+                continue
+
+            empty_streak = 0
+
+            new_links = [l for l in links if l['link'] not in seen]
+            if new_links:
+                for l in new_links:
+                    seen.add(l['link'])
+                all_links.extend(new_links)
+
+            years = [l['date'] for l in links]
+            print(f'Страница {page}: +{len(new_links)} '
+                  f'(всего {len(all_links)}), годы {min(years)}..{max(years)}')
+
+            if max(years) < self.data_start:
+                print(f'Все годы на странице < {self.data_start} — стоп')
+                break
+
+        return all_links
 
     def open_link(self, link, parametr = None):
 
@@ -80,73 +118,14 @@ class html_converter:
             response = requests.get(link, params=parametr, timeout=300)
         except requests.exceptions.RequestException as e:
             print(f'Ошибка сети при запросе {e}')
-            return 0
+            return None
         if response.status_code != 200:
             print(f'Ошибка API (Код {response.status_code}). Ответ сервера:\n{response.text[:200]}')
-            return 0
+            return None
         return response
 
 
-
-
-
-    def read_sheet_rows(self, url):
-        if isinstance(url, str) and url.startswith('http'):
-            self.open_link(url)
-        else:
-            with open(url, 'rb') as f:
-                data = f.read()
-
-
-    def detect_engine(data: bytes) -> str:
-        if data.startswith(b'\xd0\xcf\x11\xe0'):
-            return 'xlrd'  # настоящий .xls
-        if data.startswith(b'PK\x03\x04'):
-            return 'openpyxl'  # .xlsx
-        if data.startswith(b'%PDF'):
-            raise ValueError('Это PDF, а не Excel')
-        if data.startswith(b'<html') or data.startswith(b'<!DOC'):
-            raise ValueError('Сайт отдал HTML вместо файла')
-        raise ValueError(f'Неизвестный формат: {data[:8].hex(" ")}')
-
-    def read_excel_file(self, link):
-        response = requests.get(link, timeout=60)
-        if response.status_code != 200:
-            print(f'Не скачалось: {link}, код {response.status_code}')
-            return None
-
-        content = response.content
-        engine = self.detect_engine(content)  # ← bytes, не BytesIO
-        print(f'Движок: {engine}')
-
-        xl_file = pandas.ExcelFile(BytesIO(content), engine=engine)
-        print(f'Листы: {xl_file.sheet_names}')
-        print('=' * 60)
-
-        all_sheets = {}
-        for sheet_name in xl_file.sheet_names:
-            print(f"\n📄 Лист: '{sheet_name}'")
-
-            df_raw = pandas.read_excel(
-                BytesIO(content),  # ← новый BytesIO
-                sheet_name=sheet_name,
-                header=None,
-                engine=engine,  # ← тот же движок
-            )
-            all_sheets[sheet_name] = df_raw
-
-            print(f"Первые 20 строк листа '{sheet_name}':")
-            for i in range(min(20, len(df_raw))):
-                row = df_raw.iloc[i]
-                row_text = ' | '.join(
-                    str(cell) for cell in row if pandas.notna(cell)
-                )
-                if row_text.strip():
-                    print(f"  Строка {i}: {row_text[:200]}")
-            print('-' * 60)
-
-        return all_sheets
-
 if __name__=='__main__':
     test = html_converter(2023, 2026, 'https://spimex.com/markets/oil_products/trades/results/')
-    test.download_all_xlsx()
+    links = test.get_all_links(start_page=19, max_pages=422, empty_streak_limit=5)
+    print(f'\nВсего: {len(links)}')
